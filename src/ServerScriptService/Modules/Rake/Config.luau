@@ -1,36 +1,36 @@
-local Config = {
+return {
     BaseSpawnLocation = CFrame.new(0, 0, 0),
 
     -- Detecção
     MaxChaseDistance = 80,
-    DetectCloseDistance = 10,  -- detecta sem linha de visão
-    FieldOfViewAngle = 60,     -- graus (120 = campo de visão total)
+    DetectCloseDistance = 8,
+    FieldOfViewAngle = 70,
 
-    -- Movimento
-    PatrolSpeed = 8,
+    -- Velocidades
+    PatrolSpeed = 7,
+    StalkSpeed = 12,   -- velocidade ao stalkar
     ChaseSpeed = 18,
+
+    -- Stalk 
+    StalkDistance = 10,   -- distância que começa a stalkar (BASE = 20)
 
     -- Ataque
     AttackDistance = 4,
-    AttackDamage = 15,
-    AttackCooldown = 1.5,
+    AttackDamage = 25,
+    AttackCooldown = 1.2,
 
-    -- Patrulha (adiciona os pontos que quiser)
-    PatrolWanderRange = 20,
+    -- Scream ao detectar
+    ScreamDuration = 1.5,
 
-    GravityWeights = {
-        centerOfMass = 0.5, -- push to group
-        nearest = 0.5, -- push to nearest
-    },
+    -- Patrulha
+    PatrolWanderRange = 25,
+    GravityWeights = { centerOfMass = 0.5, nearest = 0.5 },
 
-    -- Animations
-
+    -- Animações
     Animations = {
         Idle = 'rbxassetid://103397043187778',
         Walk = 'rbxassetid://106204575652395',
         Run = 'rbxassetid://113598626058813',
-        Attack  = 'rbxassetid://76074105029852',
+        Attack = 'rbxassetid://76074105029852',
     },
 }
-
-return Config

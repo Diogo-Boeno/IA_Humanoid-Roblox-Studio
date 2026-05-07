@@ -9,6 +9,7 @@ local Model = workspace:FindFirstChild('The_Rake')
 local Rake = require(ServerModules:WaitForChild('Rake'))
 
 local killer = Rake.new(Model)
+
 killer:Spawn()
 
 task.spawn(function()

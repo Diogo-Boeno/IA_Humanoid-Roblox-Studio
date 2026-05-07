@@ -1,6 +1,7 @@
 local PathfindingService = game:GetService('PathfindingService')
 local Players = game:GetService('Players')
 local RunService = game:GetService('RunService')
+local SoundServices = game:GetService('SoundService')
 
 local AnimationController = require(script.AnimationController)
 
@@ -11,8 +12,10 @@ local States = {
     Idle = 'Idle',
     Patrol = 'Patrol',
     Suspicious = 'Suspicious',
+    Stalk = 'Stalk',
     Chase = 'Chase',
-    Attack = 'Attack'
+    Attack = 'Attack',
+    Scream = 'Scream'
 }
 
 function Killer.new(model)
@@ -25,8 +28,14 @@ function Killer.new(model)
     self.Target = nil
     self.State = States.Idle
     self.LastKnownPosition = nil
-    self.PatrolIndex = 1
     self.LastAttackTime = 0
+    self.FirstDetect = true
+    self._chasing = false
+    self._chaseConn = nil
+
+    self.RayParams = RaycastParams.new()
+    self.RayParams.FilterDescendantsInstances = { self.Model }
+    self.RayParams.FilterType = Enum.RaycastFilterType.Exclude
 
     self.Anim = AnimationController.new(self.Humanoid)
     self.Anim:Load(self.Config.Animations)
@@ -34,16 +43,16 @@ function Killer.new(model)
     return self
 end
 
--- Checar se há obstaculos
+-- Checar se há obstáculos
 function Killer:HasLineOfSight(targetRoot)
     local origin = self.Root.Position
     local direction = (targetRoot.Position - origin)
 
-    local rayParams = RaycastParams.new()
-    rayParams.FilterDescendantsInstances = {self.Model}
-    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    -- local rayParams = RaycastParams.new()
+    -- rayParams.FilterDescendantsInstances = {self.Model}
+    -- rayParams.FilterType = Enum.RaycastFilterType.Exclude
 
-    local result = workspace:Raycast(origin, direction, rayParams)
+    local result = workspace:Raycast(origin, direction, self.rayParams)
     if result then
         local hit = result.Instance
         local character = hit:FindFirstAncestorOfClass('Model')
@@ -68,7 +77,34 @@ function Killer:IsInFieldOfView(targetRoot)
     return angle < Config.FieldOfViewAngle
 end
 
+function Killer:FindTarget()
+    local maxDist = self.Config.MaxChaseDistance
+    local nearest = nil
 
+    for _, player in ipairs(Players:GetPlayers()) do
+        local char = player.Character
+        if not char then continue end
+
+        local root = char:FindFirstChild('HumanoidRootPart')
+        local hum = char:FindFirstChildOfClass('Humanoid')
+        if not root or not hum or hum.Health <= 0 then continue end
+
+        local dist = (self.Root.Position - root.Position).Magnitude
+
+        if dist < maxDist then
+            local inFOV = self:IsInFieldOfView(root)
+            local los = self:HasLineOfSight(root)
+            local close = dist < self.Config.DetectCloseDistance
+
+            if (inFOV and los) or close then
+                maxDist = dist
+                nearest = player
+            end
+        end
+    end
+
+    return nearest
+end
 
 function Killer:FindNearestTarget()
     local maxDistance = self.Config.MaxChaseDistance
@@ -130,6 +166,7 @@ end
 --     end
 -- end
 
+-- Smooth Pathfinding
 function Killer:MoveTo(position, interruptible)
     local path = PathfindingService:CreatePath({
         AgentHeight = 5,
@@ -165,159 +202,189 @@ function Killer:MoveTo(position, interruptible)
     return false
 end
 
+function Killer:StopChase()
+    self._chasing = false
+    if self._chasingConn then
+        self._chaseConn:Disconnect()
+        self._chaseConn = nil
+    end
+end
+
 function Killer:StartChaseLoop()
     if self._chasing then return end
     self._chasing = true
 
+    local path = PathfindingService:CreatePath({
+        AgentHeight = 5,
+        AgentRadius = 2,
+        AgentCanJump = true,
+        AgentCanClimb = true,
+        WaypointSpacing = 3,
+        Costs = {
+            Water = 20,
+        }
+    })
+
     local waypoints = {}
-    local waypointIndex = 1
-    local lastTargetPos = nil
+    local wpIndex = 1
+    local lastComputePos = nil
+    local computing = false
 
-    -- Path compute em background
-    task.spawn(function()
-        local path = PathfindingService:CreatePath({
-            AgentHeight = 5,
-            AgentRadius = 2,
-            AgentCanJump = true,
-            AgentCanClimb = true,
-            WaypointSpacing = 4,
-        })
+    local function computePath(targetPos)
+        if computing then return end
+        computing = true
 
-        while self._chasing do
-            local target = self.Target
-            local targetRoot = target and target.Character
-                and target.Character:FindFirstChild('HumanoidRootPart')
+        task.spawn(function()
+            pcall(function()
+                path:ComputeAsync(self.Root.Position, targetPos)
+            end)
 
-            if targetRoot then
-                -- Só recomputa se o target moveu mais de 4 studs
-                local targetPos = targetRoot.Position
-                if not lastTargetPos or (lastTargetPos - targetPos).Magnitude > 4 then
-                    lastTargetPos = targetPos
-
-                    pcall(function()
-                        path:ComputeAsync(self.Root.Position, targetPos)
-                    end)
-
-                    if path.Status == Enum.PathStatus.Success then
-                        local newWaypoints = path:GetWaypoints()
-                        if #newWaypoints > 1 then
-                            waypoints = newWaypoints
-                            waypointIndex = 2
+            if path.Status == Enum.PathStatus.Success then
+                local newWP = path:GetWaypoints()
+                if #newWP > 1 then
+                    -- encontra waypoint mais próximo para não parar
+                    local best     = 2
+                    local bestDist = math.huge
+                    for i = 2, #newWP do
+                        local d = (self.Root.Position - newWP[i].Position).Magnitude
+                        if d < bestDist then
+                            bestDist = d
+                            best = i
                         end
                     end
+                    waypoints = newWP
+                    wpIndex = best
                 end
             end
 
-            task.wait(0.3)
+            computing = false
+        end)
+    end
+
+    -- recomputa quando path bloqueia
+    path.Blocked:Connect(function()
+        local target = self.Target
+        local tRoot  = target and target.Character and target.Character:FindFirstChild('HumanoidRootPart')
+        if tRoot then
+            lastComputePos = nil -- força recompute
         end
     end)
 
-    -- Movimento no Heartbeat, sem nenhum yield
-    local connection
-    connection = RunService.Heartbeat:Connect(function()
-        if not self._chasing then
-            connection:Disconnect()
-            return
-        end
+    -- movimento no Heartbeat = zero pausa
+    self._chaseConn = RunService.Heartbeat:Connect(function()
+        if not self._chasing then return end
 
         local target = self.Target
-        local targetRoot = target and target.Character
-            and target.Character:FindFirstChild('HumanoidRootPart')
+        local tRoot  = target and target.Character and target.Character:FindFirstChild('HumanoidRootPart')
+        if not tRoot then return end
 
-        if not targetRoot then return end
+        local targetPos = tRoot.Position
 
-        -- Linha de visão direta: vai direto sem waypoints
-        if self:HasLineOfSight(targetRoot) then
-            self.Humanoid:MoveTo(targetRoot.Position)
+        -- linha de visão direta: vai reto, sem waypoints
+        if self:HasLineOfSight(tRoot) then
+            self.Humanoid:MoveTo(targetPos)
+            -- recomputa em background se mudou muito (para quando perder LOS)
+            if not lastComputePos or (lastComputePos - targetPos).Magnitude > 6 then
+                lastComputePos = targetPos
+                computePath(targetPos)
+            end
             return
         end
 
-        -- Sem linha de visão: segue waypoints
-        local waypoint = waypoints[waypointIndex]
-        if waypoint then
-            if waypoint.Action == Enum.PathWaypointAction.Jump then
+        -- sem LOS: segue waypoints
+        if not lastComputePos or (lastComputePos - targetPos).Magnitude > 5 then
+            lastComputePos = targetPos
+            computePath(targetPos)
+        end
+
+        local wp = waypoints[wpIndex]
+        if wp then
+            if wp.Action == Enum.PathWaypointAction.Jump then
                 self.Humanoid.Jump = true
             end
+            self.Humanoid:MoveTo(wp.Position)
 
-            self.Humanoid:MoveTo(waypoint.Position)
-
-            if (self.Root.Position - waypoint.Position).Magnitude < 3 then
-                waypointIndex = math.min(waypointIndex + 1, #waypoints)
+            if (self.Root.Position - wp.Position).Magnitude < 2.5 then
+                wpIndex = math.min(wpIndex + 1, #waypoints)
             end
         end
     end)
-end
-
-function Killer:StopChase()
-    self._chasing = false
 end
 
 function Killer:GetGravityPoint()
     local players = Players:GetPlayers()
     if #players == 0 then return end
 
-    local sum = Vector3.new(0, 0, 0)
-    local count = 0
+    local sum, count = Vector3.new(), 0
+    local nearestPos, nearestDist = nil, math.huge
 
     for _, player in pairs(players) do
         local char = player.Character
         if char and char:FindFirstChild('HumanoidRootPart') then
-            sum = sum + char.HumanoidRootPart.Position
+            local pos = char.HumanoidRootPart.Position
+            local dist = (self.Root.Position - pos).Magnitude
+            sum += pos
             count += 1
+            if dist < nearestDist then
+                nearestDist = dist
+                nearestPos = pos
+            end
         end
     end
 
     if count == 0 then return nil end
 
-    local centerOfMass = sum / count
-
-    local nearestPos = nil
-    local nearestDist = math.huge
-
-    for _, player in pairs(players) do
-        local char = player.Character
-
-        if char and char:FindFirstChild('HumanoidRootPart') then
-            local dist = (self.Root.Position - char.HumanoidRootPart.Position).Magnitude
-            if dist < nearestDist then
-                nearestDist = dist
-                nearestPos = char.HumanoidRootPart.Position
-            end
-        end
-    end
-
-    local weights = self.Config.GravityWeights or { centerOfMass = 0.5, nearest = 0.5 }
-    local gravityPoint = (centerOfMass * weights.centerOfMass) + (nearestPos * weights.nearest)
-
-    return gravityPoint
+    local w = self.Config.GravityWeights
+    return (sum / count) * w.centerOfMass + nearestPos * w.nearest
 end
 
 -- Patrol System (Move around)
 function Killer:Patrol()
     local Config = self.Config
     local gravityPoint = self:GetGravityPoint()
-
-    -- Se não tem gravity point, wander pelo mapa normalmente
     local origin = gravityPoint or self.Root.Position
     local range = Config.PatrolWanderRange or 20
 
-    -- Gera ponto aleatório ao redor do gravity point
-    local randomOffset = Vector3.new(
-        math.random(-range, range),
-        0,
+    local dest = origin + Vector3.new(
+        math.random(-range, range), 0,
         math.random(-range, range)
     )
 
-    local destination = origin + randomOffset
-
-    -- Pausa ocasional para parecer natural
-    if math.random(1, 4) == 1 then
+    if math.random(1, 5) == 1 then
         self.Humanoid.WalkSpeed = 0
-        task.wait(math.random(1, 2))
+        task.wait(math.random(1, 3))
     end
 
     self.Humanoid.WalkSpeed = Config.PatrolSpeed
-    self:MoveTo(destination, true)
+    self:BlockingMoveTo(dest, true)
+end
+
+function Killer:BlockingMoveTo(position, interruptible)
+    local path = PathfindingService:CreatePath({
+        AgentHeight = 5,
+        AgentRadius = 2,
+        AgentCanJump = true,
+        AgentCanClimb = true,
+    })
+
+    pcall(function()
+        path:ComputeAsync(self.Root.Position, position)
+    end)
+
+    if path.Status ~= Enum.PathStatus.Success then return end
+
+    for _, wp in ipairs(path:GetWaypoints()) do
+        if interruptible and self:FindTarget() then
+            return true
+        end
+
+        if wp.Action == Enum.PathWaypointAction.Jump then
+            self.Humanoid.Jump = true
+        end
+
+        self.Humanoid:MoveTo(wp.Position)
+        self.Humanoid.MoveToFinished:Wait(2)
+    end
 end
 
 -- Attack system
@@ -339,69 +406,39 @@ function Killer:Attack(target)
         track:Play(0.1)
 
         -- Dano no meio da animação (ajusta o tempo conforme a anim)
-        task.delay(track.Length * 0.4, function()
-            if humanoid and humanoid.Parent then
+    task.delay(track.Length * 0.4, function()
+        if humanoid and humanoid.Parent and targetRoot then
+            local currentDist = (self.Root.Position - targetRoot.Position).Magnitude
+            if currentDist <= self.Config.AttackDistance + 2 then -- pequena margem de erro
                 humanoid:TakeDamage(self.Config.AttackDamage)
             end
-        end)
+        end
+    end)
     else
         -- Sem animação, dano direto
         humanoid:TakeDamage(self.Config.AttackDamage)
     end
 end
 
-function Killer:UpdateAnimation()
-    -- Velocity fisica, para funcionar para o servidor
-    local velocity = self.Root.AssemblyLinearVelocity
-    local horizontalSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
-    local moving = horizontalSpeed > 0.5
-
-    -- Não interrompe animação de ataque enquanto ela toca
-    local attackTrack = self.Anim.Tracks['Attack']
-    if attackTrack and attackTrack.IsPlaying then return end
-
-    if self.State == States.Chase then
-        if moving then
-            self.Anim:Play('Run')
-        else
-            self.Anim:Play('Idle')
-        end
-
-    elseif self.State == States.Patrol or self.State == States.Suspicious then
-        if moving then
-            self.Anim:Play('Walk')
-        else
-            self.Anim:Play('Idle')
-        end
-
-    else
-        self.Anim:Play('Idle')
-    end
-end
-
 function Killer:StartAnimationLoop()
     local lastAnim = nil
-    local speedBuffer = 0 -- suaviza leituras de velocidade
+    local speedSmooth = 0 -- suaviza Velocity Reading
 
-    game:GetService('RunService').Heartbeat:Connect(function(dt)
+    RunService.Heartbeat:Connect(function(dt)
         local attackTrack = self.Anim.Tracks['Attack']
         if attackTrack and attackTrack.IsPlaying then
-            if lastAnim ~= 'Attack' then
                 lastAnim = 'Attack'
-            end
             return
         end
 
         local velocity = self.Root.AssemblyLinearVelocity
         local rawSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
-
-        -- suaviza a leitura de velocidade ao longo do tempo
-        speedBuffer = speedBuffer + (rawSpeed - speedBuffer) * (dt * 10)
+        -- speedSmooth = speedSmooth + (rawSpeed - speedSmooth) * math.min(dt * 12, 1) -- smoothening overTime
 
         local newAnim
-        if speedBuffer > 12 then
+        if rawSpeed > 12 then
             newAnim = 'Run'
-        elseif speedBuffer > 1.5 then
+        elseif rawSpeed > 1.5 then
             newAnim = 'Walk'
         else
             newAnim = 'Idle'
@@ -411,8 +448,47 @@ function Killer:StartAnimationLoop()
             lastAnim = newAnim
             self.Anim:Play(newAnim)
         end
+
+        if newAnim == 'Run' then
+    -- Se a velocidade padrão é 16 e ele está a 18, a animação toca 1.12x mais rápido
+            local playbackSpeed = rawSpeed / self.Config.ChaseSpeed
+            self.Anim:AdjustSpeed('Run', math.clamp(playbackSpeed, 0.8, 1.5))
+        elseif newAnim == 'Walk' then
+            local playbackSpeed = rawSpeed / self.Config.PatrolSpeed
+            self.Anim:AdjustSpeed('Walk', math.clamp(playbackSpeed, 0.8, 1.2))
+        end
     end)
 end
+
+-- function Killer:UpdateAnimation()
+--     -- Velocity fisica, para funcionar para o servidor
+--     local velocity = self.Root.AssemblyLinearVelocity
+--     local horizontalSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+--     local moving = horizontalSpeed > 0.5
+
+--     -- Não interrompe animação de ataque enquanto ela toca
+--     local attackTrack = self.Anim.Tracks['Attack']
+--     if attackTrack and attackTrack.IsPlaying then return end
+
+--     if self.State == States.Chase then
+--         if moving then
+--             self.Anim:Play('Run')
+--         else
+--             self.Anim:Play('Idle')
+--         end
+
+--     elseif self.State == States.Patrol or self.State == States.Suspicious then
+--         if moving then
+--             self.Anim:Play('Walk')
+--         else
+--             self.Anim:Play('Idle')
+--         end
+
+--     else
+--         self.Anim:Play('Idle')
+--     end
+-- end
+
 
 -- MainLoop
 function Killer:Start()
@@ -423,44 +499,52 @@ function Killer:Start()
         local target = self:FindNearestTarget()
 
         if target then
+            self.Target = target
             local char = target.Character
-            local targetRoot = char and char:FindFirstChild('HumanoidRootPart')
+            local targetRoot = char.HumanoidRootPart
+            self.LastKnownPosition = targetRoot.Position
+            
+            local dist = (self.Root.Position - targetRoot.Position).Magnitude
 
-            if targetRoot then
-                self.Target = target
-                self.LastKnownPosition = targetRoot.Position
-                local dist = (self.Root.Position - targetRoot.Position).Magnitude
+            if dist <= Config.AttackDistance then
+                -- ESTADO: ATAQUE
+                self.State = States.Attack
+                self:StopChase()
+                self.Humanoid.WalkSpeed = 0
+                
+                -- Olhar para o alvo suavemente durante o ataque
+                self.Root.CFrame = CFrame.lookAt(self.Root.Position, Vector3.new(targetRoot.Position.X, self.Root.Position.Y, targetRoot.Position.Z))
 
-                if dist <= Config.AttackDistance then
-                    -- Para o chase e ataca
-                    self.State = States.Attack
-                    self:StopChase()
-                    self.Humanoid.WalkSpeed = 0
-
-                    local now = tick()
-                    if now - self.LastAttackTime >= Config.AttackCooldown then
-                        self.LastAttackTime = now
-                        self:Attack(target)
-                    end
-                else
-                    -- Perseguição contínua
-                    self.State = States.Chase
-                    self.Humanoid.WalkSpeed = Config.ChaseSpeed
-                    self:StartChaseLoop() -- só inicia se não estiver rodando
+                local now = tick()
+                if now - self.LastAttackTime >= Config.AttackCooldown then
+                    self.LastAttackTime = now
+                    self:Attack(target)
                 end
+            else
+                -- ESTADO: CHASE
+                self.State = States.Chase
+                self.Humanoid.WalkSpeed = Config.ChaseSpeed
+                self:StartChaseLoop() 
             end
-
-        elseif self.LastKnownPosition then
-            self.State = States.Suspicious
-            self:StopChase()
-            self.Humanoid.WalkSpeed = Config.PatrolSpeed
-            self:MoveTo(self.LastKnownPosition)
-            self.LastKnownPosition = nil
-
         else
-            self.State = States.Patrol
-            self:StopChase()
-            self:Patrol()
+            -- PERDEU O ALVO
+            self.Target = nil
+            if self.LastKnownPosition then
+                -- ESTADO: INVESTIGAR ÚLTIMA POSIÇÃO
+                self.State = States.Suspicious
+                self:StopChase()
+                self.Humanoid.WalkSpeed = Config.PatrolSpeed
+                
+                local arrived = self:MoveTo(self.LastKnownPosition, true)
+                if arrived or not self.Target then -- Se chegou ou achou outro no caminho
+                    self.LastKnownPosition = nil
+                end
+            else
+                -- ESTADO: PATROL
+                self.State = States.Patrol
+                self:StopChase()
+                self:Patrol()
+            end
         end
 
         task.wait(0.1)
@@ -468,9 +552,12 @@ function Killer:Start()
 end
 
 function Killer:Spawn()
-    local Config = self.Config
-
-    self.Model:PivotTo(Config.BaseSpawnLocation)
+    self.Model:PivotTo(self.Config.BaseSpawnLocation)
+    for _, part in pairs(self.Model:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part:SetNetworkOwner(nil) 
+        end
+    end
 end
 
 return Killer
