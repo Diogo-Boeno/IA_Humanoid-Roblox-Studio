@@ -162,17 +162,72 @@ function Killer:MoveTo(position, interruptible)
     return false
 end
 
+function Killer:GetGravityPoint()
+    local players = Players:GetPlayers()
+    if #players == 0 then return end
+
+    local sum = Vector3.new(0, 0, 0)
+    local count = 0
+
+    for _, player in pairs(players) do
+        local char = player.Character or player.CharacterAdded:Wait()
+        if char and char:FindFirstChild('HumanoidRootPart') then
+            sum = sum + char.HumanoidRootPart.Position
+            count += 1
+        end
+    end
+
+    if count == 0 then return nil end
+
+    local centerOfMass = sum / count
+
+    local nearestPos = nil
+    local nearestDist = math.huge
+
+    for _, player in pairs(players) do
+        local char = player.Character
+
+        if char and char:FindFirstChild('HumanoidRootPart') then
+            local dist = (self.Root.Position - char.HumanoidRootPart.Position).Magnitude
+            if dist < nearestDist then
+                nearestDist = dist
+                nearestPos = char.HumanoidRootPart.Position
+            end
+        end
+    end
+
+    local weights = self.Config.GravityWeights or { centerOfMass = 0.5, nearest = 0.5 }
+    local gravityPoint = (centerOfMass * weights.centerOfMass) + (nearestPos * weights.nearest)
+
+    return gravityPoint
+end
+
 -- Patrol System (Move around)
 function Killer:Patrol()
     local Config = self.Config
-    if not Config or #Config.PatrolPoints == 0 then return end
+    local gravityPoint = self:GetGravityPoint()
 
-    local point = Config.PatrolPoints[self.PatrolIndex]
+    -- Se não tem gravity point, wander pelo mapa normalmente
+    local origin = gravityPoint or self.Root.Position
+    local range = Config.PatrolWanderRange or 20
+
+    -- Gera ponto aleatório ao redor do gravity point
+    local randomOffset = Vector3.new(
+        math.random(-range, range),
+        0,
+        math.random(-range, range)
+    )
+
+    local destination = origin + randomOffset
+
+    -- Pausa ocasional para parecer natural
+    if math.random(1, 4) == 1 then
+        self.Humanoid.WalkSpeed = 0
+        task.wait(math.random(1, 2))
+    end
+
     self.Humanoid.WalkSpeed = Config.PatrolSpeed
-
-    self:MoveTo(point, true) -- true para que ele seja interrompivel caso veja alguém
-
-    self.PatrolIndex = (self.PatrolIndex % #Config.PatrolPoints) + 1
+    self:MoveTo(destination, true)
 end
 
 -- Attack system

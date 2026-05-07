@@ -16,12 +16,12 @@ local Config = {
     AttackCooldown = 1.5,
 
     -- Patrulha (adiciona os pontos que quiser)
-    PatrolPoints = {
-        Vector3.new(0, 0, 0),
-        Vector3.new(20, 0, 0),
-        Vector3.new(20, 0, 20),
-        Vector3.new(0, 0, 20),
-    },
+    PatrolWanderRange = 20,
+
+    GravityWeights = {
+        centerOfMass = 0.5, -- push to group
+        nearest = 0.5, -- push to nearest
+    }
 }
 
 return Config
