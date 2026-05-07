@@ -1,5 +1,8 @@
 local PathfindingService = game:GetService('PathfindingService')
 local Players = game:GetService('Players')
+local RunService = game:GetService('RunService')
+
+local AnimationController = require(script.AnimationController)
 
 local Killer = {}
 Killer.__index = Killer
@@ -23,6 +26,10 @@ function Killer.new(model)
     self.State = States.Idle
     self.LastKnownPosition = nil
     self.PatrolIndex = 1
+    self.LastAttackTime = 0
+
+    self.Anim = AnimationController.new(self.Humanoid)
+    self.Anim:Load(self.Config.Animations)
 
     return self
 end
@@ -170,7 +177,7 @@ function Killer:GetGravityPoint()
     local count = 0
 
     for _, player in pairs(players) do
-        local char = player.Character or player.CharacterAdded:Wait()
+        local char = player.Character
         if char and char:FindFirstChild('HumanoidRootPart') then
             sum = sum + char.HumanoidRootPart.Position
             count += 1
@@ -235,24 +242,103 @@ function Killer:Attack(target)
     local char = target.Character
     if not char then return end
 
-    local humanoid = char:FindFirstChild('Humanoid')
+    local humanoid = char:FindFirstChildOfClass('Humanoid')
     local targetRoot = char:FindFirstChild('HumanoidRootPart')
     if not humanoid or not targetRoot then return end
     if humanoid.Health <= 0 then return end
 
     local dist = (self.Root.Position - targetRoot.Position).Magnitude
+    if dist > self.Config.AttackDistance then return end
 
-    if dist <= self.Config.AttackDistance then
+    -- Toca a animação
+    local track = self.Anim.Tracks['Attack']
+    if track then
+        track:Play(0.1)
+
+        -- Dano no meio da animação (ajusta o tempo conforme a anim)
+        task.delay(track.Length * 0.4, function()
+            if humanoid and humanoid.Parent then
+                humanoid:TakeDamage(self.Config.AttackDamage)
+            end
+        end)
+    else
+        -- Sem animação, dano direto
         humanoid:TakeDamage(self.Config.AttackDamage)
-        task.wait(self.Config.AttackCooldown)
     end
+end
+
+function Killer:UpdateAnimation()
+    -- Velocity fisica, para funcionar para o servidor
+    local velocity = self.Root.AssemblyLinearVelocity
+    local horizontalSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+    local moving = horizontalSpeed > 0.5
+
+    -- Não interrompe animação de ataque enquanto ela toca
+    local attackTrack = self.Anim.Tracks['Attack']
+    if attackTrack and attackTrack.IsPlaying then return end
+
+    if self.State == States.Chase then
+        if moving then
+            self.Anim:Play('Run')
+        else
+            self.Anim:Play('Idle')
+        end
+
+    elseif self.State == States.Patrol or self.State == States.Suspicious then
+        if moving then
+            self.Anim:Play('Walk')
+        else
+            self.Anim:Play('Idle')
+        end
+
+    else
+        self.Anim:Play('Idle')
+    end
+end
+
+function Killer:StartAnimationLoop()
+    local lastAnim = nil
+    local speedBuffer = 0 -- suaviza leituras de velocidade
+
+    game:GetService('RunService').Heartbeat:Connect(function(dt)
+        local attackTrack = self.Anim.Tracks['Attack']
+        if attackTrack and attackTrack.IsPlaying then
+            if lastAnim ~= 'Attack' then
+                lastAnim = 'Attack'
+            end
+            return
+        end
+
+        local velocity = self.Root.AssemblyLinearVelocity
+        local rawSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+
+        -- suaviza a leitura de velocidade ao longo do tempo
+        speedBuffer = speedBuffer + (rawSpeed - speedBuffer) * (dt * 10)
+
+        local newAnim
+        if speedBuffer > 12 then
+            newAnim = 'Run'
+        elseif speedBuffer > 1.5 then
+            newAnim = 'Walk'
+        else
+            newAnim = 'Idle'
+        end
+
+        if newAnim ~= lastAnim then
+            lastAnim = newAnim
+            self.Anim:Play(newAnim)
+        end
+    end)
 end
 
 -- MainLoop
 function Killer:Start()
     local Config = self.Config
 
+    self:StartAnimationLoop()
+
     while true do
+
         local target = self:FindNearestTarget()
 
         if target then
@@ -267,8 +353,11 @@ function Killer:Start()
                 if dist <= Config.AttackDistance then
                     -- Attack
                     self.State = States.Attack
-                    self.Humanoid.WalkSpeed = 6 -- 0
-                    if target and target.Character then
+                    self.Humanoid.WalkSpeed = 0 -- 0
+
+                    local now = tick()
+                    if now - self.LastAttackTime >= Config.AttackCooldown then
+                        self.LastAttackTime = now
                         self:Attack(target)
                     end
 

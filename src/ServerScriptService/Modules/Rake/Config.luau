@@ -21,7 +21,16 @@ local Config = {
     GravityWeights = {
         centerOfMass = 0.5, -- push to group
         nearest = 0.5, -- push to nearest
-    }
+    },
+
+    -- Animations
+
+    Animations = {
+        Idle = 'rbxassetid://103397043187778',
+        Walk = 'rbxassetid://106204575652395',
+        Run = 'rbxassetid://113598626058813',
+        Attack  = 'rbxassetid://76074105029852',
+    },
 }
 
 return Config
