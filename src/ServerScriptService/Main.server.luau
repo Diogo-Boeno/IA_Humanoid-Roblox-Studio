@@ -10,3 +10,9 @@ local Rake = require(ServerModules:WaitForChild('Rake'))
 
 local killer = Rake.new(Model)
 killer:Spawn()
+
+task.spawn(function()
+    killer:Chase()
+end)
+
+local Configs = require(Modules)
