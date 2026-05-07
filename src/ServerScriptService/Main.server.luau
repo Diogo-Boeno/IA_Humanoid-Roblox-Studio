@@ -12,7 +12,5 @@ local killer = Rake.new(Model)
 killer:Spawn()
 
 task.spawn(function()
-    killer:Chase()
+    killer:Start()
 end)
-
-local Configs = require(Modules)
