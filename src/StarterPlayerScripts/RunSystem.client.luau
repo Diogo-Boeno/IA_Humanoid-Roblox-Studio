@@ -4,7 +4,7 @@ local character = player.Character or player.CharacterAdded:Wait()
 local humanoid = character:WaitForChild("Humanoid")
 local animator = humanoid:WaitForChild("Animator")
 
-local SPRINT_SPEED = 20
+local SPRINT_SPEED = 22
 local WALK_SPEED = 16
 
 local anim = Instance.new("Animation")
