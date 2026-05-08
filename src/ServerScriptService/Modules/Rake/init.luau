@@ -131,40 +131,62 @@ function Killer:FindNearestTarget()
     return nearest
 end
 
--- function Killer:Chase()
---     local path = PathfindingService:CreatePath({
---         AgentHeight = 5,
---         AgentRadius = 2,
---         AgentCanJump = true,
---     })
-    
---     while true do
---         local target = self:FindNearestTarget()
-        
---         if target then
---             local targetRoot = target.Character and target.Character:FindFirstChild('HumanoidRootPart')
---             if targetRoot then
---                 local success, err = pcall(function()
---                     path:ComputeAsync(self.Root.Position, targetRoot.Position)
---                 end)
-                
---                 if success and path.Status == Enum.PathStatus.Success then
---                     local waypoints = path:GetWaypoints()
-                    
---                     for _, waypoint in pairs(waypoints) do
---                         if waypoint.Action == Enum.PathWaypointAction.Jump then
---                             self.Humanoid.Jump = true
---                         end
---                         self.Humanoid:MoveTo(waypoint.Position)
---                         self.Humanoid.MoveToFinished:Wait()
---                     end
---                 end
---             end
---         end
-        
---         task.wait(0.5)
---     end
--- end
+function Killer:GetPlayerNoiseLevel(player: Player): number
+	local char = player.Character
+	if not char then
+		return 0
+	end
+	local root = char:FindFirstChild("HumanoidRootPart") :: BasePart?
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not root or not hum or hum.Health <= 0 then
+		return 0
+	end
+	local v = root.AssemblyLinearVelocity
+	local horiz = Vector3.new(v.X, 0, v.Z).Magnitude
+	local cap = math.max(hum.WalkSpeed, 1)
+	-- sprint / corrida forte tende a ~1; arrastar devagar ~0.2
+	return math.clamp(horiz / cap, 0, 1)
+end
+
+-- Ouve o jogador mais "suspeito" dentro de HearingDistance (usa LOS para enfraquecer atrás de paredes).
+function Killer:HearNearestNoisyPlayer(): Player?
+	local cfg = self.Config
+	local bestPlayer: Player? = nil
+	local bestScore = 0
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local char = plr.Character
+		if not char then
+			continue
+		end
+		local root = char:FindFirstChild("HumanoidRootPart") :: BasePart?
+		if not root then
+			continue
+		end
+		local dist = (self.Root.Position - root.Position).Magnitude
+		if dist > cfg.HearingDistance then
+			continue
+		end
+		local noise = self:GetPlayerNoiseLevel(plr)
+		if noise < 0.35 then -- muito quieto = ignora (sobe este valor se quiseres mais sensível)
+			continue
+		end
+		if not self:HasLineOfSight(root) then
+			noise *= 0.45 -- atrás de obstáculo: ouve mal
+		end
+		local score = noise * (1 - dist / cfg.HearingDistance)
+		if score > bestScore then
+			bestScore = score
+			bestPlayer = plr
+		end
+	end
+	return bestPlayer
+end
+
+function Killer:AddHorizontalJitter(pos: Vector3, radius: number): Vector3
+	local a = math.random() * math.pi * 2
+	local r = math.random() * radius
+	return pos + Vector3.new(math.cos(a) * r, 0, math.sin(a) * r)
+end
 
 -- Smooth Pathfinding
 function Killer:MoveTo(position, interruptible)
@@ -460,50 +482,29 @@ function Killer:StartAnimationLoop()
     end)
 end
 
--- function Killer:UpdateAnimation()
---     -- Velocity fisica, para funcionar para o servidor
---     local velocity = self.Root.AssemblyLinearVelocity
---     local horizontalSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
---     local moving = horizontalSpeed > 0.5
-
---     -- Não interrompe animação de ataque enquanto ela toca
---     local attackTrack = self.Anim.Tracks['Attack']
---     if attackTrack and attackTrack.IsPlaying then return end
-
---     if self.State == States.Chase then
---         if moving then
---             self.Anim:Play('Run')
---         else
---             self.Anim:Play('Idle')
---         end
-
---     elseif self.State == States.Patrol or self.State == States.Suspicious then
---         if moving then
---             self.Anim:Play('Walk')
---         else
---             self.Anim:Play('Idle')
---         end
-
---     else
---         self.Anim:Play('Idle')
---     end
--- end
-
-
 -- MainLoop
 function Killer:Start()
     local Config = self.Config
     self:StartAnimationLoop()
 
     while true do
-        local target = self:FindNearestTarget()
+        local seenTarget = self:FindNearestTarget()
+        local target = seenTarget or self:HearNearestNoisyPlayer()
 
         if target then
             self.Target = target
             local char = target.Character
             local targetRoot = char.HumanoidRootPart
-            self.LastKnownPosition = targetRoot.Position
-            
+            -- Só “incerteza” quando o alvo veio pelo som; se viu, guarda posição real.
+            if seenTarget then
+                self.LastKnownPosition = targetRoot.Position
+            else
+                self.LastKnownPosition = self:AddHorizontalJitter(
+                    targetRoot.Position,
+                    self.InvestigationJitterRadius or 6
+                )
+            end
+
             local dist = (self.Root.Position - targetRoot.Position).Magnitude
 
             if dist <= Config.AttackDistance then
