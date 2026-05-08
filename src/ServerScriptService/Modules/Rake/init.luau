@@ -2,6 +2,7 @@ local PathfindingService = game:GetService('PathfindingService')
 local Players = game:GetService('Players')
 local RunService = game:GetService('RunService')
 local SoundServices = game:GetService('SoundService')
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local AnimationController = require(script.AnimationController)
 
@@ -25,6 +26,9 @@ function Killer.new(model)
     self.Model = model
     self.Humanoid = model:FindFirstChild('Humanoid')
     self.Root = model:FindFirstChild('HumanoidRootPart')
+    if self.Humanoid then
+        self.Humanoid.AutoRotate = true
+    end
     self.Target = nil
     self.State = States.Idle
     self.LastKnownPosition = nil
@@ -36,6 +40,43 @@ function Killer.new(model)
     self._screaming = false
     self._lastSeenTargetId = nil
     self._lastScreamTime = 0
+    self._targetLockUntil = 0
+    self._searchUntil = 0
+    self._searchCenter = nil
+    self._searchIndex = 1
+    self._searchPoints = nil
+    self._searching = false
+    self._lostSightSince = nil
+    self._lastVisiblePos = nil
+    self._lastHeardPos = nil
+    self._lastHeardAt = 0
+    self._lastHeardScore = 0
+    self._noiseMemoryPos = nil
+    self._noiseMemoryUntil = 0
+    self._investigateNoiseUntil = 0
+    self._investigating = false
+    self._investigatingPos = nil
+
+    -- evento global para ruídos (ex: gravetos, portas, tiros)
+    -- qualquer script pode fazer: ReplicatedStorage.RakeNoise:Fire(pos, loudness)
+    local noiseEvent = ReplicatedStorage:FindFirstChild("RakeNoise")
+    if not noiseEvent then
+        noiseEvent = Instance.new("BindableEvent")
+        noiseEvent.Name = "RakeNoise"
+        noiseEvent.Parent = ReplicatedStorage
+    end
+    self._noiseEvent = noiseEvent
+    self._noiseConn = noiseEvent.Event:Connect(function(pos, loudness)
+        if typeof(pos) ~= "Vector3" then return end
+        loudness = tonumber(loudness) or 1
+        loudness = math.clamp(loudness, 0.1, 10)
+        self._lastHeardPos = pos
+        self._lastHeardAt = time()
+        self._lastHeardScore = loudness
+    end)
+
+    self._patrolling = false
+    self._patrolConn = nil
 
     -- reduz padrão determinístico do math.random ao reiniciar o servidor
     math.randomseed(math.floor(tick() * 1000000))
@@ -50,7 +91,270 @@ function Killer.new(model)
     return self
 end
 
--- Checar se há obstáculos
+function Killer:ProjectToGround(pos: Vector3): Vector3
+    local startY = (pos.Y + 80)
+    local rayOrigin = Vector3.new(pos.X, startY, pos.Z)
+    local rayDir = Vector3.new(0, -250, 0)
+    local hit = workspace:Raycast(rayOrigin, rayDir, self.RayParams)
+    if hit then
+        return hit.Position
+    end
+    return Vector3.new(pos.X, self.Root.Position.Y, pos.Z)
+end
+
+function Killer:RememberNoise(pos: Vector3, score: number)
+    -- trava um ponto de ruído por um tempo curto para evitar “seguir o player em tempo real”
+    local now = time()
+    local ttl = (self.Config.NoiseMemoryTime or 1.0)
+    -- se não tem memória, se expirou, ou se o novo score é bem melhor, atualiza
+    local farEnough = self._noiseMemoryPos and (pos - self._noiseMemoryPos).Magnitude >= 6 or false
+    if not self._noiseMemoryPos
+        or now >= (self._noiseMemoryUntil or 0)
+        or farEnough
+        or score > (self._noiseMemoryScore or 0) + 0.08
+    then
+        self._noiseMemoryPos = self:ProjectToGround(pos)
+        self._noiseMemoryUntil = now + ttl
+        self._noiseMemoryScore = score
+    end
+end
+
+function Killer:GetRememberedNoise(): (Vector3?, number)
+    if self._noiseMemoryPos and time() < (self._noiseMemoryUntil or 0) then
+        return self._noiseMemoryPos, (self._noiseMemoryScore or 0)
+    end
+    return nil, 0
+end
+
+-- Retorna a melhor posição de ruído detectada por "audição" (a partir de players).
+function Killer:HearNoisePosition(): (Vector3?, number)
+	local cfg = self.Config
+	local h = cfg.Hearing or {}
+	local walkDist = h.WalkDistance or 18
+	local runDist = h.RunDistance or 36
+	local minNoise = h.MinNoise or 0.22
+	local runNoise = h.RunNoise or 0.70
+	local occMul = h.OccludedMultiplier or 0.15
+	local occMaxFactor = h.OccludedMaxDistanceFactor or 0.6
+	local eventMaxDist = h.EventMaxDistance or 50
+
+	local bestPos: Vector3? = nil
+	local bestScore = 0
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local char = plr.Character
+		if not char then
+			continue
+		end
+		local root = char:FindFirstChild("HumanoidRootPart") :: BasePart?
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		if not root then
+			continue
+		end
+
+		local noise = self:GetPlayerNoiseLevel(plr)
+		if noise < minNoise then
+			continue
+		end
+
+		-- define alcance baseado em andar vs correr
+		local maxDist = walkDist
+		if noise >= runNoise then
+			maxDist = runDist
+		end
+
+		local dist = (self.Root.Position - root.Position).Magnitude
+		if dist > maxDist then
+			continue
+		end
+
+		if not self:HasLineOfSight(root) then
+			-- atrás de obstáculo: AINDA detecta (como você pediu), só fica menos “confiável”
+			-- e pode reduzir o alcance efetivo se o OccludedMaxDistanceFactor < 1.
+			if dist > (maxDist * occMaxFactor) then
+				continue
+			end
+			noise *= occMul
+		end
+
+		local score = noise * (1 - dist / maxDist)
+		if score > bestScore then
+			bestScore = score
+			bestPos = root.Position
+		end
+	end
+
+	-- também considera ruídos explícitos (BindableEvent)
+	if self._lastHeardPos and (time() - (self._lastHeardAt or 0)) < 1.2 then
+		local dist = (self.Root.Position - self._lastHeardPos).Magnitude
+		if dist <= eventMaxDist then
+			-- loudness 0.1..10 → 0..1
+			local loud01 = math.clamp((self._lastHeardScore or 1) / 10, 0.05, 1)
+			local score = loud01 * (1 - dist / eventMaxDist)
+			if score > bestScore then
+				bestScore = score
+				bestPos = self._lastHeardPos
+			end
+		end
+	end
+
+	return bestPos, bestScore
+end
+
+function Killer:InvestigateNoise(pos: Vector3)
+    -- evita reiniciar a investigação a cada tick: só bloqueia enquanto está rodando
+    if self._investigating then
+        return
+    end
+
+    self._investigating = true
+    local dest = self:ProjectToGround(pos)
+
+    task.spawn(function()
+        local ok, err = pcall(function()
+            -- corre até o local do ruído e entra em busca ao redor
+            self.State = States.Suspicious
+            self:StopChase()
+            self.Target = nil
+
+            self.Humanoid.WalkSpeed = self.Config.CheckNoiseSpeed -- “vem correndo checar”
+            -- Não interrompe por hearing aqui (senão ele se auto-interrompe e fica parado).
+            self:BlockingMoveTo(dest, true, false)
+
+            -- ao chegar (ou interromper por visão), vira busca na área
+            self:StartSearch(dest)
+        end)
+
+        if not ok then
+            warn("[Rake] InvestigateNoise failed:", err)
+        end
+
+        self._investigating = false
+    end)
+end
+
+function Killer:IsValidTarget(player: Player?): boolean
+    if not player then return false end
+    local char = player.Character
+    if not char then return false end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not root or not hum or hum.Health <= 0 then
+        return false
+    end
+    return true
+end
+
+function Killer:BuildSearchPoints(center: Vector3, radius: number, count: number): { Vector3 }
+    local points = {}
+    for i = 1, count do
+        local a = (i / count) * math.pi * 2
+        local r = radius * (0.55 + 0.45 * math.random())
+        local p = center + Vector3.new(math.cos(a) * r, 0, math.sin(a) * r)
+        table.insert(points, p)
+    end
+    -- adiciona 1 ponto no centro também (olhar ao redor)
+    table.insert(points, center)
+    return points
+end
+
+function Killer:StartSearch(center: Vector3)
+    local cfg = self.Config
+    self.State = States.Suspicious
+    self:StopChase()
+    self.Target = nil
+
+    self._searchCenter = center
+    self._searchUntil = time() + (cfg.InvestigationTime or 10)
+    self._searchIndex = 1
+    self._searchPoints = self:BuildSearchPoints(center, (cfg.HearingDistance or 25) * 0.55, 6)
+end
+
+function Killer:StartSearchLoop()
+    if self._searching then return end
+    self._searching = true
+
+    task.spawn(function()
+        while self._searching do
+            if not self._searchCenter or time() >= (self._searchUntil or 0) then
+                self._searching = false
+                break
+            end
+
+            if self._investigating or self._screaming then
+                task.wait(0.1)
+                continue
+            end
+
+            local seen = self:FindVisibleTarget()
+            if seen then
+                -- se viu, encerra busca imediatamente
+                self._searchCenter = nil
+                self._searchPoints = nil
+                self._searchIndex = 1
+                self._searching = false
+                break
+            end
+
+            local noisePos, noiseScore = self:HearNoisePosition()
+            if noisePos and noiseScore > 0 then
+                self:RememberNoise(noisePos, noiseScore)
+            end
+            noisePos, noiseScore = self:GetRememberedNoise()
+            if noisePos and noiseScore >= (self.Config.NoiseInvestigateThreshold or 0.18) then
+                -- ouviu algo forte durante a busca
+                self._searchCenter = nil
+                self._searchPoints = nil
+                self._searchIndex = 1
+                self._searching = false
+                if not self._investigating then
+                    self:InvestigateNoise(noisePos) -- self:InvestigateNoise(self:AddHorizontalJitter(noisePos, self.InvestigationJitterRadius or 6))
+                end
+                break
+            end
+
+            self:SearchStep()
+            task.wait(0.1)
+        end
+    end)
+end
+
+function Killer:StopSearchLoop()
+    self._searching = false
+end
+
+function Killer:SearchStep(): boolean
+    -- retorna true quando terminou a busca
+    if not self._searchCenter or time() >= (self._searchUntil or 0) then
+        self._searchCenter = nil
+        self._searchPoints = nil
+        self._searchIndex = 1
+        return true
+    end
+
+    local cfg = self.Config
+    self.Humanoid.WalkSpeed = cfg.InvestigationSpeed or cfg.PatrolSpeed
+
+    local points = self._searchPoints
+    if not points or #points == 0 then
+        self._searchPoints = self:BuildSearchPoints(self._searchCenter, (cfg.HearingDistance or 25) * 0.55, 6)
+        points = self._searchPoints
+    end
+
+    local p = points[self._searchIndex]
+    self._searchIndex += 1
+    if self._searchIndex > #points then
+        self._searchIndex = 1
+        -- pequena variação de pontos a cada ciclo
+        self._searchPoints = self:BuildSearchPoints(self._searchCenter, (cfg.HearingDistance or 25) * 0.55, 6)
+    end
+
+    self:BlockingMoveTo(p, true, false)
+    task.wait(0.35 + math.random() * 0.45)
+    return false
+end
+
+-- Checar obstaculos
 function Killer:HasLineOfSight(targetRoot)
     local origin = self.Root.Position
     local direction = (targetRoot.Position - origin)
@@ -76,7 +380,7 @@ end
 function Killer:IsInFieldOfView(targetRoot)
     local Config = self.Config
     local toTarget = (targetRoot.Position - self.Root.Position).Unit
-    local lookVector = self.Root.CFrame.lookVector
+    local lookVector = self.Root.CFrame.LookVector
 
     local dot = toTarget:Dot(lookVector)
     local angle = math.deg(math.acos(dot))
@@ -113,24 +417,30 @@ function Killer:FindTarget()
     return nearest
 end
 
-function Killer:FindNearestTarget()
-    local maxDistance = self.Config.MaxChaseDistance
-    local nearest = nil
+function Killer:FindVisibleTarget(): Player?
+    local maxDist = self.Config.MaxChaseDistance
+    local nearest: Player? = nil
 
-    for _, player in pairs(Players:GetPlayers()) do
+    for _, player in ipairs(Players:GetPlayers()) do
         local char = player.Character
-        if char and char:FindFirstChild('HumanoidRootPart') then
-            local targetRoot = char.HumanoidRootPart
-            local dist = (self.Root.Position - targetRoot.Position).Magnitude
+        if not char then continue end
 
-            if dist < maxDistance then
-                if self:IsInFieldOfView(targetRoot) and self:HasLineOfSight(targetRoot) then
-                    maxDistance = dist
-                    nearest = player
-                elseif dist < self.Config.DetectCloseDistance then
-                    maxDistance = dist
-                    nearest = player
-                end
+        local root = char:FindFirstChild("HumanoidRootPart") :: BasePart?
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not root or not hum or hum.Health <= 0 then continue end
+
+        local dist = (self.Root.Position - root.Position).Magnitude
+        if dist < maxDist then
+            local los = self:HasLineOfSight(root)
+            if not los then
+                continue
+            end
+
+            local closeVisible = dist <= (self.Config.DetectCloseDistance or 12) * 1.35
+
+            if closeVisible or self:IsInFieldOfView(root) then
+                maxDist = dist
+                nearest = player
             end
         end
     end
@@ -155,80 +465,10 @@ function Killer:GetPlayerNoiseLevel(player: Player): number
 	return math.clamp(horiz / cap, 0, 1)
 end
 
--- Ouve o jogador mais "suspeito" dentro de HearingDistance (usa LOS para enfraquecer atrás de paredes).
-function Killer:HearNearestNoisyPlayer(): Player?
-	local cfg = self.Config
-	local bestPlayer: Player? = nil
-	local bestScore = 0
-	for _, plr in ipairs(Players:GetPlayers()) do
-		local char = plr.Character
-		if not char then
-			continue
-		end
-		local root = char:FindFirstChild("HumanoidRootPart") :: BasePart?
-		if not root then
-			continue
-		end
-		local dist = (self.Root.Position - root.Position).Magnitude
-		if dist > cfg.HearingDistance then
-			continue
-		end
-		local noise = self:GetPlayerNoiseLevel(plr)
-		if noise < 0.35 then -- muito quieto = ignora (sobe este valor se quiseres mais sensível)
-			continue
-		end
-		if not self:HasLineOfSight(root) then
-			noise *= 0.45 -- atrás de obstáculo: ouve mal
-		end
-		local score = noise * (1 - dist / cfg.HearingDistance)
-		if score > bestScore then
-			bestScore = score
-			bestPlayer = plr
-		end
-	end
-	return bestPlayer
-end
-
 function Killer:AddHorizontalJitter(pos: Vector3, radius: number): Vector3
 	local a = math.random() * math.pi * 2
 	local r = math.random() * radius
 	return pos + Vector3.new(math.cos(a) * r, 0, math.sin(a) * r)
-end
-
--- Smooth Pathfinding
-function Killer:MoveTo(position, interruptible)
-    local path = PathfindingService:CreatePath({
-        AgentHeight = 5,
-        AgentRadius = 2,
-        AgentCanJump = true,
-        AgentCanClimb = true,
-    })
-
-    local success = pcall(function()
-        path:ComputeAsync(self.Root.Position, position)
-    end)
-
-    if success and path.Status == Enum.PathStatus.Success then
-        local waypoints = path:GetWaypoints()
-
-        for _, waypoint in pairs(waypoints) do
-            if interruptible and self:FindNearestTarget() then
-                self.Humanoid:MoveTo(self.Root.Position)
-                return true
-            end
-
-            if waypoint.Action == Enum.PathWaypointAction.Jump then
-                self.Humanoid.Jump = true
-            end
-
-            self.Humanoid:MoveTo(waypoint.Position)
-
-            local moved = self.Humanoid.MoveToFinished:Wait(1)
-            if not moved then break end
-        end
-    end
-
-    return false
 end
 
 function Killer:StopChase()
@@ -295,21 +535,21 @@ function Killer:StartChaseLoop()
             and target.Character:FindFirstChild('HumanoidRootPart') :: BasePart?
         if not tRoot then return end
 
-        -- ── PREDICTION: estima onde o player estará daqui a t segundos ──
+        -- estima onde o player estará daqui a t segundos 
         local vel = tRoot.AssemblyLinearVelocity
         local horizVel = Vector3.new(vel.X, 0, vel.Z)
         local dist = (self.Root.Position - tRoot.Position).Magnitude
         local t = math.clamp(dist / math.max(self.Config.ChaseSpeed, 1), 0.05, 0.9)
         local predictedPos = tRoot.Position + horizVel * t
 
-        -- ── DECISÃO: LOS → vai ao ponto previsto; sem LOS → segue path ──
+        -- LOS  vai ao ponto previsto; sem LOS → segue path 
         if self:HasLineOfSight(tRoot) then
-            -- suaviza a direção com steering (evita viragens bruscas)
+            -- suaviza a direção com steering lerp
             local desired = (predictedPos - self.Root.Position)
             local moveTarget = self.Root.Position + desired.Unit * 6
             self.Humanoid:MoveTo(moveTarget)
 
-            -- mantém path calculado para quando perder LOS
+            -- mantem path calculado para quando perder LOS
             if not lastComputePos or (lastComputePos - predictedPos).Magnitude > 5 then
                 lastComputePos = predictedPos
                 computePath(predictedPos)
@@ -323,7 +563,7 @@ function Killer:StartChaseLoop()
             computePath(predictedPos)
         end
 
-        -- ── LOOKAHEAD: mira 2 waypoints à frente para curvas mais suaves ──
+        --  LOOKAHEAD
         local lookIdx = math.min(wpIndex + 2, #waypoints)
         local wp = waypoints[lookIdx]
         if wp then
@@ -367,7 +607,7 @@ function Killer:GetGravityPoint()
     return (sum / count) * w.centerOfMass + nearestPos * w.nearest
 end
 
--- Patrol System (Move around)
+-- Patrol System
 function Killer:Patrol()
     local Config = self.Config
     local gravityPoint = self:GetGravityPoint()
@@ -393,14 +633,13 @@ function Killer:Patrol()
 
         local character = hit.Instance and hit.Instance:FindFirstAncestorOfClass('Model')
         if character and Players:GetPlayerFromCharacter(character) then
-            -- não apontar para "em cima" do jogador
+            -- não apontar para "em cima" do player
             return Vector3.new(x, self.Root.Position.Y, z)
         end
 
         return hit.Position
     end
 
-    -- Evita travar: tenta vários destinos se um cair num lugar ruim/obstáculo.
     local maxTries = 6
     local tries = 0
     local currentRange = range
@@ -426,12 +665,47 @@ function Killer:Patrol()
             end
         end
 
-        -- Se falhar muito, reduz o alcance para achar pontos mais fáceis.
+        -- Se falhar muito reduz o alcance para achar pontos mais faceis
         currentRange = math.max(8, currentRange * 0.7)
     end
 end
 
-function Killer:BlockingMoveTo(position, interruptible)
+function Killer:StartPatrolLoop()
+    if self._patrolling then return end
+    self._patrolling = true
+
+    task.spawn(function()
+        while self._patrolling do
+            -- para patrulha se entrar em investigação/chase/scream
+            if self._investigating or self._screaming then
+                task.wait(0.1)
+                continue
+            end
+
+            local seen = self:FindVisibleTarget()
+            if seen then
+                self._patrolling = false
+                break
+            end
+
+            -- se houver som alto
+            local nPos, nScore = self:HearNoisePosition()
+            if nPos and nScore >= (self.Config.NoiseInvestigateThreshold or 0.18) then
+                self._patrolling = false
+                break
+            end
+
+            self:Patrol()
+            task.wait(0.1)
+        end
+    end)
+end
+
+function Killer:StopPatrolLoop()
+    self._patrolling = false
+end
+
+function Killer:BlockingMoveTo(position, interruptible, interruptOnNoise)
     local path = PathfindingService:CreatePath({
         AgentHeight = 5,
         AgentRadius = 2,
@@ -454,9 +728,21 @@ function Killer:BlockingMoveTo(position, interruptible)
     local lastPos = self.Root.Position
 
     for _, wp in ipairs(path:GetWaypoints()) do
-        if interruptible and self:FindTarget() then
-            lastPos = self.Root.Position
-            return true, false, lastPos
+        if interruptible then
+            -- Se viu alguém de verdade breaka insta
+            if self:FindVisibleTarget() then
+                lastPos = self.Root.Position
+                return true, false, lastPos
+            end
+            if interruptOnNoise ~= false then
+                -- Se ouviu alguém perto
+                local noisePos, noiseScore = self:HearNoisePosition()
+                local threshold = (self.Config.NoiseMoveInterruptThreshold or 0.12)
+                if noisePos and noiseScore >= threshold then
+                    lastPos = self.Root.Position
+                    return true, false, lastPos
+                end
+            end
         end
 
         if wp.Action == Enum.PathWaypointAction.Jump then
@@ -465,7 +751,7 @@ function Killer:BlockingMoveTo(position, interruptible)
 
         local dist = (self.Root.Position - wp.Position).Magnitude
         local speed = math.max(self.Humanoid.WalkSpeed, self.Config.PatrolSpeed, 1)
-        -- Tempo suficiente para chegar, mas não deixa prender para sempre.
+        -- Tempo suficiente para chegar sem stuck
         local timeout = math.clamp(dist / speed + 0.6, 1, 3.5)
 
         self.Humanoid:MoveTo(wp.Position)
@@ -495,12 +781,12 @@ function Killer:Attack(target)
     local dist = (self.Root.Position - targetRoot.Position).Magnitude
     if dist > self.Config.AttackDistance then return end
 
-    -- Toca a animação
+    -- Toca a anim
     local track = self.Anim.Tracks['Attack']
     if track then
         track:Play(0.1)
 
-        -- Dano no meio da animação (ajusta o tempo conforme a anim)
+        -- Dano no meio da anim
     task.delay(track.Length * 0.4, function()
         if humanoid and humanoid.Parent and targetRoot then
             local currentDist = (self.Root.Position - targetRoot.Position).Magnitude
@@ -510,7 +796,7 @@ function Killer:Attack(target)
         end
     end)
     else
-        -- Sem animação, dano direto
+        -- Sem anim
         humanoid:TakeDamage(self.Config.AttackDamage)
     end
 end
@@ -535,7 +821,6 @@ function Killer:DoScream(targetRoot: BasePart?)
         track:Play(0.1)
     end
 
-    -- Se existir um Sound chamado "ScreamSound" dentro do modelo, toca.
     local screamSound = self.Model:FindFirstChild("ScreamSound", true)
     if screamSound and screamSound:IsA("Sound") then
         screamSound:Play()
@@ -559,12 +844,12 @@ function Killer:StartAnimationLoop()
 
         local velocity = self.Root.AssemblyLinearVelocity
         local rawSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
-        -- speedSmooth = speedSmooth + (rawSpeed - speedSmooth) * math.min(dt * 12, 1) -- smoothening overTime
+        speedSmooth = speedSmooth + (rawSpeed - speedSmooth) * math.min(dt * 12, 1) -- smoothening overTime
 
         local newAnim
-        if rawSpeed > 12 then
+        if speedSmooth > 12 then
             newAnim = 'Run'
-        elseif rawSpeed > 1.5 then
+        elseif speedSmooth > 1.5 then
             newAnim = 'Walk'
         else
             newAnim = 'Idle'
@@ -576,11 +861,10 @@ function Killer:StartAnimationLoop()
         end
 
         if newAnim == 'Run' then
-    -- Se a velocidade padrão é 16 e ele está a 18, a animação toca 1.12x mais rápido
-            local playbackSpeed = rawSpeed / self.Config.ChaseSpeed
+            local playbackSpeed = speedSmooth / self.Config.ChaseSpeed
             self.Anim:AdjustSpeed('Run', math.clamp(playbackSpeed, 0.8, 1.5))
         elseif newAnim == 'Walk' then
-            local playbackSpeed = rawSpeed / self.Config.PatrolSpeed
+            local playbackSpeed = speedSmooth / self.Config.PatrolSpeed
             self.Anim:AdjustSpeed('Walk', math.clamp(playbackSpeed, 0.8, 1.2))
         end
     end)
@@ -592,28 +876,80 @@ function Killer:Start()
     self:StartAnimationLoop()
 
     while true do
-        local seenTarget = self:FindNearestTarget()
-        local target = seenTarget or self:HearNearestNoisyPlayer()
+        if self._investigating then
+            local seen = self:FindVisibleTarget()
+            if seen then
+                -- breaka a investigação para permitir chase normal
+                self._investigating = false
+            else
+                task.wait(0.1)
+                continue
+            end
+        end
+
+        -- Se está em modo busca, NÃO fica “telepático” pegando nearest a cada tick.
+        -- Só sai do modo busca se ver alguém ou ouvir alguém bem de perto.
+        local searchingActive = (self._searchCenter and time() < (self._searchUntil or 0)) or false
+        if searchingActive then
+            -- busca roda em background, mas o cérebro continua reagindo (visão/ruído).
+            self:StartSearchLoop()
+        end
+
+        -- Alvo visível (real) vs. apenas “travado”.
+        local visibleTarget = self:FindVisibleTarget()
+        local noisePos, noiseScore = nil, 0
+
+        -- Target lock: só mantém se ainda estiver “perto” e (idealmente) visível com frequência.
+        local lockedTarget = self.Target
+        local lockActive = lockedTarget
+            and time() < (self._targetLockUntil or 0)
+            and self:IsValidTarget(lockedTarget)
+
+        -- hearing só é considerado quando não há alvo visível
+        if not visibleTarget then
+            noisePos, noiseScore = self:HearNoisePosition()
+            if noisePos and noiseScore > 0 then
+                self:RememberNoise(noisePos, noiseScore)
+            end
+            noisePos, noiseScore = self:GetRememberedNoise()
+        end
+
+        -- alvo escolhido para agir
+        local target = visibleTarget or (lockActive and lockedTarget) or nil
 
         if target then
+            -- se viu de verdade, para loops de patrol/search/investigate competindo
+            if visibleTarget then
+                self:StopPatrolLoop()
+                self:StopSearchLoop()
+                self._investigating = false
+            end
+            -- Se não está visível e só foi “ouvido”, NÃO entra em chase: entra em busca.
+            -- (nada aqui; ouvir sem ver é tratado no bloco "sem alvo" abaixo)
+
             self.Target = target
+            if visibleTarget then
+                self._targetLockUntil = time() + (Config.TargetLockTime or 3.5)
+            end
             local char = target.Character
             local targetRoot = char.HumanoidRootPart
-            -- Só “incerteza” quando o alvo veio pelo som; se viu, guarda posição real.
-            if seenTarget then
+            -- atualiza memória apenas quando vê de verdade
+            if visibleTarget then
                 self.LastKnownPosition = targetRoot.Position
+                self._lastVisiblePos = targetRoot.Position
+                self._lostSightSince = nil
             else
-                self.LastKnownPosition = self:AddHorizontalJitter(
-                    targetRoot.Position,
-                    self.InvestigationJitterRadius or 6
-                )
+                -- perdeu LOS: começa timer de “desistência”
+                if not self._lostSightSince then
+                    self._lostSightSince = time()
+                end
             end
 
             local dist = (self.Root.Position - targetRoot.Position).Magnitude
 
             -- Scream quando "vê" o player (telegraph) para não pegar desprevenido.
             -- Regra: só por visão + cooldown (não precisa ser alvo novo).
-            if seenTarget and not self._screaming and self.State ~= States.Attack then
+            if visibleTarget and not self._screaming and self.State ~= States.Attack then
                 self._lastSeenTargetId = target.UserId
 
                 local now = time()
@@ -632,6 +968,21 @@ function Killer:Start()
                 continue
             end
 
+            -- Se ficou tempo demais sem ver o alvo, para de perseguir “telepaticamente” e entra em busca.
+            if not visibleTarget and self._lostSightSince then
+                local giveUp = Config.HideAfterLostTarget or 8
+                if (time() - self._lostSightSince) >= giveUp then
+                    self:StopChase()
+                    self.Target = nil
+                    if self._lastVisiblePos then
+                        self:StartSearch(self._lastVisiblePos)
+                        self._lastVisiblePos = nil
+                    end
+                    task.wait(0.1)
+                    continue
+                end
+            end
+
             if dist <= Config.AttackDistance then
                 -- ESTADO: ATAQUE
                 self.State = States.Attack
@@ -647,29 +998,51 @@ function Killer:Start()
                     self:Attack(target)
                 end
             else
-                -- ESTADO: CHASE
-                self.State = States.Chase
-                self.Humanoid.WalkSpeed = Config.ChaseSpeed
-                self:StartChaseLoop() 
+                -- Só entra em CHASE se estiver visível de verdade.
+                if visibleTarget then
+                    self.State = States.Chase
+                    self.Humanoid.WalkSpeed = Config.ChaseSpeed
+                    self:StopPatrolLoop()
+                    self:StopSearchLoop()
+                    self:StopChase()
+                    self:StartChaseLoop()
+                else
+                    -- sem visão: mantém suspeita/busca, não sprint infinito
+                    self:StopChase()
+                    -- Se está ouvindo algo, investiga correndo; senão, busca na última posição visível.
+                    if noisePos and noiseScore >= (Config.NoiseInvestigateThreshold or 0.18) then
+                        self:InvestigateNoise(noisePos) -- self:InvestigateNoise(self:AddHorizontalJitter(noisePos, self.InvestigationJitterRadius or 6))
+                    elseif self._lastVisiblePos then
+                        self:StartSearch(self._lastVisiblePos)
+                        self._lastVisiblePos = nil
+                    end
+                end
             end
         else
-            -- PERDEU O ALVO
             self.Target = nil
-            if self.LastKnownPosition then
-                -- ESTADO: INVESTIGAR ÚLTIMA POSIÇÃO
-                self.State = States.Suspicious
-                self:StopChase()
-                self.Humanoid.WalkSpeed = Config.InvestigationSpeed or Config.PatrolSpeed
-                
-                local arrived = self:MoveTo(self.LastKnownPosition, true)
-                if arrived or not self.Target then -- Se chegou ou achou outro no caminho
-                    self.LastKnownPosition = nil
+
+            -- Se ouviu um ruído alto e perto, corre pra checar
+            if noisePos and noiseScore >= (Config.NoiseInvestigateThreshold or 0.18) then
+                local now = time()
+                if now >= (self._investigateNoiseUntil or 0) then
+                    self._investigateNoiseUntil = now + (Config.NoiseInvestigateCooldown or 1.2)
+                    if not self._investigating then
+                        local investigatePos = self:AddHorizontalJitter(noisePos, self.InvestigationJitterRadius or 6)
+                        self:InvestigateNoise(investigatePos)
+                    end
                 end
+
+            elseif self.LastKnownPosition then
+                -- ESTADO: BUSCA / SUSPEITA
+                self:StartSearch(self.LastKnownPosition)
+                self.LastKnownPosition = nil
             else
                 -- ESTADO: PATROL
                 self.State = States.Patrol
                 self:StopChase()
-                self:Patrol()
+                if not searchingActive then
+                    self:StartPatrolLoop()
+                end
             end
         end
 
