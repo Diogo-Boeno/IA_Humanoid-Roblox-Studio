@@ -32,6 +32,10 @@ function Killer.new(model)
     self.FirstDetect = true
     self._chasing = false
     self._chaseConn = nil
+    self._lastPatrolStop = nil
+
+    -- reduz padrão determinístico do math.random ao reiniciar o servidor
+    math.randomseed(math.floor(tick() * 1000000))
 
     self.RayParams = RaycastParams.new()
     self.RayParams.FilterDescendantsInstances = { self.Model }
@@ -242,9 +246,7 @@ function Killer:StartChaseLoop()
         AgentCanJump = true,
         AgentCanClimb = true,
         WaypointSpacing = 3,
-        Costs = {
-            Water = 20,
-        }
+        Costs = { Water = 20 }
     })
 
     local waypoints = {}
@@ -255,79 +257,81 @@ function Killer:StartChaseLoop()
     local function computePath(targetPos)
         if computing then return end
         computing = true
-
         task.spawn(function()
             pcall(function()
                 path:ComputeAsync(self.Root.Position, targetPos)
             end)
-
             if path.Status == Enum.PathStatus.Success then
                 local newWP = path:GetWaypoints()
                 if #newWP > 1 then
-                    -- encontra waypoint mais próximo para não parar
-                    local best     = 2
-                    local bestDist = math.huge
+                    -- começa pelo waypoint mais perto do Rake (não recua)
+                    local best, bestDist = 2, math.huge
                     for i = 2, #newWP do
                         local d = (self.Root.Position - newWP[i].Position).Magnitude
-                        if d < bestDist then
-                            bestDist = d
-                            best = i
-                        end
+                        if d < bestDist then bestDist = d; best = i end
                     end
                     waypoints = newWP
                     wpIndex = best
                 end
             end
-
             computing = false
         end)
     end
 
-    -- recomputa quando path bloqueia
     path.Blocked:Connect(function()
-        local target = self.Target
-        local tRoot  = target and target.Character and target.Character:FindFirstChild('HumanoidRootPart')
-        if tRoot then
-            lastComputePos = nil -- força recompute
-        end
+        local tRoot = self.Target and self.Target.Character
+            and self.Target.Character:FindFirstChild('HumanoidRootPart')
+        if tRoot then lastComputePos = nil end
     end)
 
-    -- movimento no Heartbeat = zero pausa
-    self._chaseConn = RunService.Heartbeat:Connect(function()
+    self._chaseConn = RunService.Heartbeat:Connect(function(dt)
         if not self._chasing then return end
 
         local target = self.Target
-        local tRoot  = target and target.Character and target.Character:FindFirstChild('HumanoidRootPart')
+        local tRoot = target and target.Character
+            and target.Character:FindFirstChild('HumanoidRootPart') :: BasePart?
         if not tRoot then return end
 
-        local targetPos = tRoot.Position
+        -- ── PREDICTION: estima onde o player estará daqui a t segundos ──
+        local vel = tRoot.AssemblyLinearVelocity
+        local horizVel = Vector3.new(vel.X, 0, vel.Z)
+        local dist = (self.Root.Position - tRoot.Position).Magnitude
+        local t = math.clamp(dist / math.max(self.Config.ChaseSpeed, 1), 0.05, 0.9)
+        local predictedPos = tRoot.Position + horizVel * t
 
-        -- linha de visão direta: vai reto, sem waypoints
+        -- ── DECISÃO: LOS → vai ao ponto previsto; sem LOS → segue path ──
         if self:HasLineOfSight(tRoot) then
-            self.Humanoid:MoveTo(targetPos)
-            -- recomputa em background se mudou muito (para quando perder LOS)
-            if not lastComputePos or (lastComputePos - targetPos).Magnitude > 6 then
-                lastComputePos = targetPos
-                computePath(targetPos)
+            -- suaviza a direção com steering (evita viragens bruscas)
+            local desired = (predictedPos - self.Root.Position)
+            local moveTarget = self.Root.Position + desired.Unit * 6
+            self.Humanoid:MoveTo(moveTarget)
+
+            -- mantém path calculado para quando perder LOS
+            if not lastComputePos or (lastComputePos - predictedPos).Magnitude > 5 then
+                lastComputePos = predictedPos
+                computePath(predictedPos)
             end
             return
         end
 
-        -- sem LOS: segue waypoints
-        if not lastComputePos or (lastComputePos - targetPos).Magnitude > 5 then
-            lastComputePos = targetPos
-            computePath(targetPos)
+        -- recomputa path se o alvo se moveu bastante
+        if not lastComputePos or (lastComputePos - predictedPos).Magnitude > 4 then
+            lastComputePos = predictedPos
+            computePath(predictedPos)
         end
 
-        local wp = waypoints[wpIndex]
+        -- ── LOOKAHEAD: mira 2 waypoints à frente para curvas mais suaves ──
+        local lookIdx = math.min(wpIndex + 2, #waypoints)
+        local wp = waypoints[lookIdx]
         if wp then
             if wp.Action == Enum.PathWaypointAction.Jump then
                 self.Humanoid.Jump = true
             end
             self.Humanoid:MoveTo(wp.Position)
 
-            if (self.Root.Position - wp.Position).Magnitude < 2.5 then
-                wpIndex = math.min(wpIndex + 1, #waypoints)
+            -- avança índice quando chega perto
+            if (self.Root.Position - wp.Position).Magnitude < 3 then
+                wpIndex = math.min(lookIdx + 1, #waypoints)
             end
         end
     end)
@@ -367,18 +371,61 @@ function Killer:Patrol()
     local origin = gravityPoint or self.Root.Position
     local range = Config.PatrolWanderRange or 20
 
-    local dest = origin + Vector3.new(
-        math.random(-range, range), 0,
-        math.random(-range, range)
-    )
-
     if math.random(1, 5) == 1 then
         self.Humanoid.WalkSpeed = 0
         task.wait(math.random(1, 3))
     end
 
     self.Humanoid.WalkSpeed = Config.PatrolSpeed
-    self:BlockingMoveTo(dest, true)
+
+    local function GetGroundAtXZ(x: number, z: number): Vector3
+        local startY = (self.Root.Position.Y + 50)
+        local rayOrigin = Vector3.new(x, startY, z)
+        local rayDir = Vector3.new(0, -200, 0)
+
+        local hit = workspace:Raycast(rayOrigin, rayDir, self.RayParams)
+        if not hit then
+            return Vector3.new(x, self.Root.Position.Y, z)
+        end
+
+        local character = hit.Instance and hit.Instance:FindFirstAncestorOfClass('Model')
+        if character and Players:GetPlayerFromCharacter(character) then
+            -- não apontar para "em cima" do jogador
+            return Vector3.new(x, self.Root.Position.Y, z)
+        end
+
+        return hit.Position
+    end
+
+    -- Evita travar: tenta vários destinos se um cair num lugar ruim/obstáculo.
+    local maxTries = 6
+    local tries = 0
+    local currentRange = range
+    while tries < maxTries do
+        tries += 1
+
+        local x = origin.X + math.random(-currentRange, currentRange)
+        local z = origin.Z + math.random(-currentRange, currentRange)
+        local dest = GetGroundAtXZ(x, z)
+
+        local attemptStartPos = self.Root.Position
+        local interrupted, reached, stopPos = self:BlockingMoveTo(dest, true)
+        if interrupted then
+            return
+        end
+
+        if reached and stopPos then
+            local moved = (stopPos - attemptStartPos).Magnitude
+            local repeatedStop = self._lastPatrolStop and (stopPos - self._lastPatrolStop).Magnitude < 1.5
+            if moved >= 1.5 and not repeatedStop then
+                self._lastPatrolStop = stopPos
+                return
+            end
+        end
+
+        -- Se falhar muito, reduz o alcance para achar pontos mais fáceis.
+        currentRange = math.max(8, currentRange * 0.7)
+    end
 end
 
 function Killer:BlockingMoveTo(position, interruptible)
@@ -389,24 +436,47 @@ function Killer:BlockingMoveTo(position, interruptible)
         AgentCanClimb = true,
     })
 
-    pcall(function()
+    local ok = pcall(function()
         path:ComputeAsync(self.Root.Position, position)
     end)
 
-    if path.Status ~= Enum.PathStatus.Success then return end
+    if not ok then
+        return false, false, self.Root.Position
+    end
+
+    if path.Status ~= Enum.PathStatus.Success then
+        return false, false, self.Root.Position
+    end
+
+    local lastPos = self.Root.Position
 
     for _, wp in ipairs(path:GetWaypoints()) do
         if interruptible and self:FindTarget() then
-            return true
+            lastPos = self.Root.Position
+            return true, false, lastPos
         end
 
         if wp.Action == Enum.PathWaypointAction.Jump then
             self.Humanoid.Jump = true
         end
 
+        local dist = (self.Root.Position - wp.Position).Magnitude
+        local speed = math.max(self.Humanoid.WalkSpeed, self.Config.PatrolSpeed, 1)
+        -- Tempo suficiente para chegar, mas não deixa prender para sempre.
+        local timeout = math.clamp(dist / speed + 0.6, 1, 3.5)
+
         self.Humanoid:MoveTo(wp.Position)
-        self.Humanoid.MoveToFinished:Wait(2)
+
+        local moved = self.Humanoid.MoveToFinished:Wait(timeout)
+        if not moved then
+            lastPos = self.Root.Position
+            return false, false, lastPos
+        end
+
+        lastPos = self.Root.Position
     end
+
+    return false, true, lastPos
 end
 
 -- Attack system
