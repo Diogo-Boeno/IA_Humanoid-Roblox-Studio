@@ -33,6 +33,9 @@ function Killer.new(model)
     self._chasing = false
     self._chaseConn = nil
     self._lastPatrolStop = nil
+    self._screaming = false
+    self._lastSeenTargetId = nil
+    self._lastScreamTime = 0
 
     -- reduz padrão determinístico do math.random ao reiniciar o servidor
     math.randomseed(math.floor(tick() * 1000000))
@@ -512,6 +515,37 @@ function Killer:Attack(target)
     end
 end
 
+function Killer:DoScream(targetRoot: BasePart?)
+    if self._screaming then return end
+    self._screaming = true
+
+    self.State = States.Scream
+    self:StopChase()
+    self.Humanoid.WalkSpeed = 0
+
+    if targetRoot then
+        self.Root.CFrame = CFrame.lookAt(
+            self.Root.Position,
+            Vector3.new(targetRoot.Position.X, self.Root.Position.Y, targetRoot.Position.Z)
+        )
+    end
+
+    local track = self.Anim.Tracks["Scream"]
+    if track then
+        track:Play(0.1)
+    end
+
+    -- Se existir um Sound chamado "ScreamSound" dentro do modelo, toca.
+    local screamSound = self.Model:FindFirstChild("ScreamSound", true)
+    if screamSound and screamSound:IsA("Sound") then
+        screamSound:Play()
+    end
+
+    task.delay(self.Config.ScreamDuration or 2, function()
+        self._screaming = false
+    end)
+end
+
 function Killer:StartAnimationLoop()
     local lastAnim = nil
     local speedSmooth = 0 -- suaviza Velocity Reading
@@ -577,6 +611,27 @@ function Killer:Start()
 
             local dist = (self.Root.Position - targetRoot.Position).Magnitude
 
+            -- Scream quando "vê" o player (telegraph) para não pegar desprevenido.
+            -- Regra: só por visão + cooldown (não precisa ser alvo novo).
+            if seenTarget and not self._screaming and self.State ~= States.Attack then
+                self._lastSeenTargetId = target.UserId
+
+                local now = time()
+                local cooldown = Config.ScreamCooldown or 18
+                local canScream = (now - (self._lastScreamTime or 0)) >= cooldown
+
+                if canScream and math.random() < (Config.ScreamChance or 0) then
+                    self._lastScreamTime = now
+                    self:DoScream(targetRoot)
+                end
+            end
+
+            -- enquanto grita, não faz chase/attack
+            if self._screaming then
+                task.wait(0.1)
+                continue
+            end
+
             if dist <= Config.AttackDistance then
                 -- ESTADO: ATAQUE
                 self.State = States.Attack
@@ -604,7 +659,7 @@ function Killer:Start()
                 -- ESTADO: INVESTIGAR ÚLTIMA POSIÇÃO
                 self.State = States.Suspicious
                 self:StopChase()
-                self.Humanoid.WalkSpeed = Config.PatrolSpeed
+                self.Humanoid.WalkSpeed = Config.InvestigationSpeed or Config.PatrolSpeed
                 
                 local arrived = self:MoveTo(self.LastKnownPosition, true)
                 if arrived or not self.Target then -- Se chegou ou achou outro no caminho

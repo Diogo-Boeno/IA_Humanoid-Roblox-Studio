@@ -38,7 +38,7 @@ return {
         Walk = 'rbxassetid://106204575652395',
         Run = 'rbxassetid://113598626058813',
         Attack = 'rbxassetid://76074105029852',
-        Scream = 'rbxassetid://76074105029852', -- mudar
+        Scream = 'rbxassetid://114676740361584', -- of
         Stalk = 'rbxassetid://103397043187778', -- mudar
     }
 }
