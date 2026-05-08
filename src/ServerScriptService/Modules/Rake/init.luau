@@ -52,7 +52,7 @@ function Killer:HasLineOfSight(targetRoot)
     -- rayParams.FilterDescendantsInstances = {self.Model}
     -- rayParams.FilterType = Enum.RaycastFilterType.Exclude
 
-    local result = workspace:Raycast(origin, direction, self.rayParams)
+    local result = workspace:Raycast(origin, direction, self.RayParams)
     if result then
         local hit = result.Instance
         local character = hit:FindFirstAncestorOfClass('Model')
@@ -204,7 +204,7 @@ end
 
 function Killer:StopChase()
     self._chasing = false
-    if self._chasingConn then
+    if self._chaseConn then
         self._chaseConn:Disconnect()
         self._chaseConn = nil
     end
