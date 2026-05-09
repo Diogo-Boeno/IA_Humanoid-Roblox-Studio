@@ -19,8 +19,6 @@ return {
         -- acima disso considera "corrida"
         RunNoise = 0.60,
 
-        -- Ruído através de parede/estrutura (multiplicador + alcance efetivo)
-        -- 0.15 estava fraco demais: atrás de parede o score não passava do threshold.
         OccludedMultiplier = 0.40, -- 0.35
         OccludedMaxDistanceFactor = 1.0, -- % do alcance quando não tem LOS (1.0 = ouve através de paredes na mesma distância)
 
@@ -47,12 +45,13 @@ return {
     -- Comportamento The Rake
     ScreamChance = 0.7, -- 70% chance de gritar ao detectar
     ScreamDuration = 2.0,
-    HideAfterLostTarget = 8, -- Se esconde após X segundos
+    HideAfterLostTarget = 20, -- Se esconde após X segundos -- 8
     InvestigationTime = 10, -- Tempo investigando
     NoiseInvestigateThreshold = 0.18,
     NoiseInvestigateCooldown = 1.2,
     NoiseMemoryTime = 2.5,
     NoiseMoveInterruptThreshold = 0.12,
+    TargetLockTime = 10, -- 3.5 segundos
     
     -- Patrulha inteligente
     PatrolWanderRange = 35,

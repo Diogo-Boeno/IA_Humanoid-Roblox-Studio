@@ -56,6 +56,8 @@ function Killer.new(model)
     self._investigateNoiseUntil = 0
     self._investigating = false
     self._investigatingPos = nil
+    self._hadLOS = false
+    self._targetMemory = {} -- {userId = {pos, _until, score}}
 
     -- evento global para ruídos (ex: gravetos, portas, tiros)
     -- qualquer script pode fazer: ReplicatedStorage.RakeNoise:Fire(pos, loudness)
@@ -376,6 +378,27 @@ function Killer:HasLineOfSight(targetRoot)
     return true
 end
 
+function Killer:RememberTarget(player, pos)
+    local now = time()
+    self._targetMemory[player.UserId] = {
+        pos = pos,
+        _until = now + 15,
+        score = 1.0
+    }
+end
+
+function Killer:GetBestMemoryTarget()
+    local best, bestScore = nil, 0
+    local now = time()
+    for userId, mem in pairs(self._targetMemory) do
+        if now < mem._until and mem.score > bestScore then
+            bestScore = mem.score
+            best = Players:GetPlayerByUserId(userId)
+        end
+    end
+    return best
+end
+
 -- FOV of the killer
 function Killer:IsInFieldOfView(targetRoot)
     local Config = self.Config
@@ -542,7 +565,7 @@ function Killer:StartChaseLoop()
         local t = math.clamp(dist / math.max(self.Config.ChaseSpeed, 1), 0.05, 0.9)
         local predictedPos = tRoot.Position + horizVel * t
 
-        -- LOS  vai ao ponto previsto; sem LOS → segue path 
+        -- LOS  vai ao ponto previsto; sem LOS segue path
         if self:HasLineOfSight(tRoot) then
             -- suaviza a direção com steering lerp
             local desired = (predictedPos - self.Root.Position)
@@ -554,7 +577,13 @@ function Killer:StartChaseLoop()
                 lastComputePos = predictedPos
                 computePath(predictedPos)
             end
+            self._hadLOS = true
             return
+        end
+
+        if self._hadLOS then
+            self._hadLOS = false
+            lastComputePos = nil
         end
 
         -- recomputa path se o alvo se moveu bastante
@@ -929,7 +958,7 @@ function Killer:Start()
 
             self.Target = target
             if visibleTarget then
-                self._targetLockUntil = time() + (Config.TargetLockTime or 3.5)
+                self._targetLockUntil = time() + (Config.TargetLockTime or 6.0) --3.5
             end
             local char = target.Character
             local targetRoot = char.HumanoidRootPart
@@ -938,6 +967,8 @@ function Killer:Start()
                 self.LastKnownPosition = targetRoot.Position
                 self._lastVisiblePos = targetRoot.Position
                 self._lostSightSince = nil
+
+                self:RememberTarget(target, targetRoot.Position)
             else
                 -- perdeu LOS: começa timer de “desistência”
                 if not self._lostSightSince then
@@ -947,8 +978,6 @@ function Killer:Start()
 
             local dist = (self.Root.Position - targetRoot.Position).Magnitude
 
-            -- Scream quando "vê" o player (telegraph) para não pegar desprevenido.
-            -- Regra: só por visão + cooldown (não precisa ser alvo novo).
             if visibleTarget and not self._screaming and self.State ~= States.Attack then
                 self._lastSeenTargetId = target.UserId
 
@@ -964,19 +993,21 @@ function Killer:Start()
 
             -- enquanto grita, não faz chase/attack
             if self._screaming then
-                task.wait(0.1)
+                task.wait(0.05)
                 continue
             end
 
             -- Se ficou tempo demais sem ver o alvo, para de perseguir “telepaticamente” e entra em busca.
             if not visibleTarget and self._lostSightSince then
-                local giveUp = Config.HideAfterLostTarget or 8
-                if (time() - self._lostSightSince) >= giveUp then
+                local giveUp = Config.HideAfterLostTarget or 12 -- 8
+                local distToLastSeen = self._lastVisiblePos and (self.Root.Position - self._lastVisiblePos).Magnitude or 999
+
+                if (time() - self._lostSightSince) >= giveUp and distToLastSeen > 35 then
                     self:StopChase()
                     self.Target = nil
                     if self._lastVisiblePos then
                         self:StartSearch(self._lastVisiblePos)
-                        self._lastVisiblePos = nil
+                        -- self._lastVisiblePos = nil
                     end
                     task.wait(0.1)
                     continue
@@ -998,20 +1029,22 @@ function Killer:Start()
                     self:Attack(target)
                 end
             else
-                -- Só entra em CHASE se estiver visível de verdade.
                 if visibleTarget then
-                    self.State = States.Chase
-                    self.Humanoid.WalkSpeed = Config.ChaseSpeed
-                    self:StopPatrolLoop()
-                    self:StopSearchLoop()
-                    self:StopChase()
-                    self:StartChaseLoop()
+                    if self.State ~= States.Chase then
+                        self.State = States.Chase
+                        self.Humanoid.WalkSpeed = Config.ChaseSpeed
+                        self:StopChase()
+                        self:StartChaseLoop()
+                    end
                 else
-                    -- sem visão: mantém suspeita/busca, não sprint infinito
+
                     self:StopChase()
-                    -- Se está ouvindo algo, investiga correndo; senão, busca na última posição visível.
                     if noisePos and noiseScore >= (Config.NoiseInvestigateThreshold or 0.18) then
                         self:InvestigateNoise(noisePos) -- self:InvestigateNoise(self:AddHorizontalJitter(noisePos, self.InvestigationJitterRadius or 6))
+                    elseif self:GetBestMemoryTarget() then
+                        local memoryTarget = self:GetBestMemoryTarget()
+                        local mem = self._targetMemory[memoryTarget.UserId]
+                        self:StartSearch(mem.pos)
                     elseif self._lastVisiblePos then
                         self:StartSearch(self._lastVisiblePos)
                         self._lastVisiblePos = nil
@@ -1051,6 +1084,21 @@ function Killer:Start()
 end
 
 function Killer:Spawn()
+    local Config = self.Config
+    self:StartAnimationLoop()
+
+    spawn(function()
+        while true do
+            local now = time()
+            for userId, mem in pairs(self._targetMemory) do
+                if now > mem._until then
+                    self._targetMemory[userId] = nil
+                end
+            end
+            task.wait(5)
+        end
+    end)
+
     self.Model:PivotTo(self.Config.BaseSpawnLocation)
     for _, part in pairs(self.Model:GetDescendants()) do
         if part:IsA("BasePart") then
